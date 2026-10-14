@@ -176,3 +176,76 @@ A read-only replay with the branch script against #1753, #1759, and #1762 as of
 each `mergedAt` exits `0`, the same as `main`. Live, all three exit the same as
 `main`: `0` for #1759, and `5` for #1753 and #1762 on the post-merge `reconcile`
 check. Open #1746 exits `3` on its failing `shell-tests` under both scripts.
+
+## Amendment (2026-10-14, #1784) — the run inventory reaches `jq` by file
+
+Decision 2 reads the run inventory for every head, and a full run object embeds its
+repository, head repository, actor, and head commit. On verJSON/AiB#347 eleven runs made
+a 143,901-byte listing; passed as `jq --argjson`, it exceeded Linux's 128 KiB
+per-argument limit (`MAX_ARG_STRLEN`), so the exec failed with `Argument list too long`
+and the gate exited `1` on exactly the re-triggered heads it exists to admit. That failed
+closed, but it left the head unevaluable, and this decision requires every head to be
+evaluated.
+
+`scripts/assert-mergeable-head.sh` now writes each response, and each value derived from
+one, to a scratch directory owned by the script's single EXIT trap. `jq` reads those
+values with `--slurpfile` or on stdin. Only script constants and validated scalars still
+travel as arguments. No gate rule, conclusion set, or exit code changes.
+
+The run listing is deliberately NOT cut down to the fields the gate reads today. Once
+every payload travels by file, size no longer matters to correctness, and a field
+allowlist would be a latent fail-open: a later reader of an unlisted field
+(`run_attempt`, `head_branch`, `pull_requests`) would see `null` for every run. An
+exclusion such as `select(.x != …)` in `superseder` or Gate A's unfinished-run arm
+would then match every run. The validated inventory keeps each run as GitHub reported
+it.
+
+Verification: the 131 runs of `scripts/assert-mergeable-head.test.sh` give byte-identical
+output and exit codes before and after the change. `scripts/assert-mergeable-head.large-payload.test.sh`
+drives oversized inputs to the same verdicts that equivalent small inputs reach:
+admission, a pending last-page run under Gate A, and a failing check under Gate C. Before
+the change those inputs failed with the real kernel `E2BIG` error. Reintroducing argv
+transport at any of the nine sites fails that test. Live, AiB#347 now prints `true` and
+exits `0`.
+
+## Amendment (2026-10-14, #1786) — every inventory page must carry an array
+
+Decision 3 validates the run inventory by type, never by truthiness, but that check
+applied only to each run and not to the page that holds the runs. `reconcile_pages`
+counted each page's collection with `length`, which also measures a string, an object's
+keys, and a number. The readers iterate with `[]?`, which yields nothing from a string,
+null, or number, and iterates the values of an object. So a single page whose wrongly
+typed collection had a `length` equal to `total_count` reconciled, and so did a null
+collection on any page. The gate then reasoned over an empty or forged inventory and
+printed `true`. On `origin/main`, 12 of the 24 new fixtures were admitted this way. They
+cover all three endpoints (check runs, commit statuses, and workflow runs).
+
+`require_array_pages` now runs on each endpoint's response before reconciliation. It
+requires every page to be an object whose collection has type `array`. Under
+`jq -e`, a `false` result, a jq error, and unparseable input all exit `1`. Each refusal
+names the endpoint and says the inventory "carries a malformed page". Empty array pages
+are unaffected, and an empty response is still refused by reconciliation. The 131
+existing fixtures give byte-identical output.
+
+Verification: `scripts/assert-mergeable-head.test.sh` covers string, object, null, and
+number collections, on a sole page and on the last page, for each endpoint. All 24 cases
+must exit `1`. Four cases with empty arrays keep their current verdicts. Each of these
+mutations fails the suite:
+
+- removing the guard for any one endpoint;
+- replacing the type check with truthiness (`!= null`, or the bare value);
+- dropping `-e`;
+- checking `any` page, or only the first page;
+- accepting a non-object page.
+
+The annotations Gate B reads for ADR 0156 had the same weakness in a different form. That
+endpoint states no `total_count`, so nothing reconciles its walk. A success with an
+empty or blank body, or with an object, null, or string page, produced no titles and was
+read as "no deferral annotation". Six such bodies were admitted with `true` on
+`origin/main`. Each annotations response must now be one or more pages, every one a
+JSON array, under `jq -e`. Anything else fails closed with exit `1` and a message saying
+the response is no evidence that the check carries no deferral annotation. A walk of
+`[]` pages still means none, and a deferral on a later page still blocks with exit `4`.
+These mutations each fail the suite: removing the check, dropping the non-empty
+requirement, using truthiness instead of the type, dropping `-e`, and checking `any`
+page.

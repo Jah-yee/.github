@@ -56,10 +56,15 @@ case "$args" in
     # Logged so a test can prove the workflow-run read happens only when a cancelled
     # check run makes it necessary (#1754): callers without Actions read keep working.
     [ -z "${RUNS_REQUEST_LOG:-}" ] || printf '%s\n' "$args" >>"$RUNS_REQUEST_LOG"
+    # Lists the caller's TMPDIR mid-run, so a test can prove the script's scratch
+    # directory really lived there before asserting it is gone afterwards (#1784).
+    [ -z "${TMPDIR_PROBE_LOG:-}" ] || ls -A "$TMPDIR" >>"$TMPDIR_PROBE_LOG"
     [ "${FAIL_RUNS:-0}" -eq 0 ] || { echo "gh: some transient API error (HTTP 502)" >&2; exit 1; }
     printf '%s\n' "$RUNS_FIXTURE" ;;
   *"/annotations?per_page"*)
     [ "${FAIL_ANNOTATIONS:-0}" -eq 0 ] || { echo "gh: some transient API error (HTTP 502)" >&2; exit 1; }
+    # A success with no body at all: not even the newline every other reply ends with.
+    [ "${ANNOTATIONS_EMPTY_BODY:-0}" -eq 0 ] || exit 0
     printf '%s\n' "$ANNOTATIONS_FIXTURE" ;;
   *)
     echo "gh: unstubbed call: $args" >&2; exit 1 ;;
@@ -127,7 +132,7 @@ expect_true_unbound() { # label
 
 reset_env() {
   unset FAIL_PR_VIEW FAIL_RULES FAIL_RULES_HTTP RULES_STDERR_NOTE \
-    FAIL_CHECK_RUNS FAIL_STATUS FAIL_ANNOTATIONS FAIL_RUNS
+    FAIL_CHECK_RUNS FAIL_STATUS FAIL_ANNOTATIONS FAIL_RUNS ANNOTATIONS_EMPTY_BODY
   export RULES_FIXTURE="$rules_bound"
   export RUNS_REQUEST_LOG="$tmp/runs-requests"
   : >"$RUNS_REQUEST_LOG"
@@ -767,6 +772,36 @@ ANNOTATIONS_FIXTURE='[{"title":"CI deferred","message":"nothing ran"}]'
 run
 expect "an ADR 0156 deferral annotation still blocks the composite-action path" 4 "carries a deferral annotation"
 
+# The annotations endpoint states no total_count, so nothing reconciles its walk. A
+# success whose body is empty, blank, or not a JSON array per page carries no evidence
+# either way, and reading it as "no deferral annotation" admits the very head ADR 0156
+# exists to stop (#1786). Each such body is a fault; a genuine `[]` stays "none".
+for body in empty blank object null string array-then-object; do
+  reset_env
+  case "$body" in
+    empty) export ANNOTATIONS_EMPTY_BODY=1 ;;
+    blank) ANNOTATIONS_FIXTURE='   ' ;;
+    object) ANNOTATIONS_FIXTURE='{}' ;;
+    null) ANNOTATIONS_FIXTURE='null' ;;
+    string) ANNOTATIONS_FIXTURE='"CI deferred"' ;;
+    array-then-object) ANNOTATIONS_FIXTURE='[]{}' ;;
+  esac
+  run
+  expect "an annotations response that is $body is a fault, not 'no deferral' (#1786)" \
+    1 "the annotations response for check-run 1 on Verjson/verjson-ci is empty or not a JSON array on every page"
+done
+
+reset_env
+ANNOTATIONS_FIXTURE='[][]'
+run
+expect_true "an annotations walk of empty arrays still reads as no deferral (#1786)"
+
+reset_env
+ANNOTATIONS_FIXTURE='[]
+[{"title":"CI deferred","message":"nothing ran"}]'
+run
+expect "a deferral annotation on a later annotations page still blocks (#1786)" 4 "carries a deferral annotation"
+
 # --- Gate C -----------------------------------------------------------------
 reset_env
 CHECK_RUNS_FIXTURE="$(runs "$green_runs,$(check_run 3 'mirror-contract' completed failure "$APP_ID")")"
@@ -911,6 +946,78 @@ run
 expect "a commit-status response that states no total_count is unattested, not empty" \
   1 "commit-status inventory for"
 
+# A page's collection must BE an array (#1786). The page walk counted it with `length`,
+# which also measures a string, an object's keys, and a number, and the readers' `[]?`
+# then yield nothing from a string, null, or number and iterate an object's values. So
+# a SOLE page with a wrong-typed collection whose `length` matched `total_count`
+# reconciled and was read as an empty -- or forged -- inventory: the gate answered
+# `true` with no run, status, or check it could see. A null collection reconciled as
+# zero on ANY page. Every shape is placed both ways -- as the sole page, and as the last
+# page after a real one -- with every page stating the total that the old `length`
+# arithmetic produced, so each fixture is one the old count accepted or refused only by
+# accident of arithmetic. The type is what is checked, never truthiness.
+malformed_page() { # placement(sole|last) base-page field malformed-value -> body
+  jq -c --arg at "$1" --arg f "$3" --argjson bad "$4" '
+    if $at == "sole" then {total_count: ($bad | length), ($f): $bad}
+    else ((.[$f] | length) + ($bad | length)) as $total
+      | (. + {total_count: $total}), {total_count: $total, ($f): $bad} end' <<<"$2"
+}
+green_check="$(check_run 1 'ci / build-test' completed success "$APP_ID")"
+green_check_2="$(check_run 2 'changelog / validate' completed success "$APP_ID")"
+ok_status='{"context":"lint","state":"success"}'
+ok_wf_run="$(wf_run 9100 600 "$WF_OTHER" 1 push completed success)"
+for placement in sole last; do
+  for shape in string object null number; do
+    case "$shape" in
+      string) check_bad='"x"' status_bad='"x"' run_bad='"x"' ;;
+      object) check_bad="{\"a\":$green_check,\"b\":$green_check_2}" status_bad="{\"a\":$ok_status}" run_bad="{\"a\":$ok_wf_run}" ;;
+      null) check_bad=null status_bad=null run_bad=null ;;
+      number) check_bad=1 status_bad=1 run_bad=1 ;;
+    esac
+
+    reset_env
+    CHECK_RUNS_FIXTURE="$(malformed_page "$placement" "$(runs "$green_runs")" check_runs "$check_bad")"
+    run
+    expect "a $placement check-run page whose check_runs is a $shape is malformed, not an inventory (#1786)" \
+      1 "the check-run inventory for Verjson/verjson-ci@$HEAD_SHA carries a malformed page"
+
+    reset_env
+    STATUS_FIXTURE="$(malformed_page "$placement" "$(stat_page "$ok_status")" statuses "$status_bad")"
+    run
+    expect "a $placement commit-status page whose statuses is a $shape is malformed, not an inventory (#1786)" \
+      1 "the commit-status inventory for Verjson/verjson-ci@$HEAD_SHA carries a malformed page"
+
+    reset_env
+    RUNS_FIXTURE="$(malformed_page "$placement" "$(wf_runs "$ok_wf_run")" workflow_runs "$run_bad")"
+    run
+    expect "a $placement workflow-run page whose workflow_runs is a $shape is malformed, not an inventory (#1786)" \
+      1 "the workflow-run inventory for Verjson/verjson-ci@$HEAD_SHA carries a malformed page"
+  done
+done
+
+# The type check must not turn a genuinely empty page into a fault: an empty array on a
+# complete listing is an empty collection, and the verdict is the one-page verdict.
+reset_env
+CHECK_RUNS_FIXTURE="$(malformed_page last "$(runs "$green_runs")" check_runs '[]')"
+run
+expect_true "a check-run listing whose last page is an empty array is still admitted (#1786)"
+
+reset_env
+STATUS_FIXTURE="$(malformed_page last "$(stat_page "$ok_status")" statuses '[]')"
+run
+expect_true "a commit-status listing whose last page is an empty array is still admitted (#1786)"
+
+reset_env
+RUNS_FIXTURE="$(malformed_page last "$(wf_runs "$ok_wf_run")" workflow_runs '[]')"
+run
+expect_true "a workflow-run listing whose last page is an empty array is still admitted (#1786)"
+
+reset_env
+CHECK_RUNS_FIXTURE="$(runs '')"
+run
+expect "an empty check-run listing still reports every required context absent (#1786)" \
+  3 "absent: ci / build-test"
+
 reset_env; FAIL_CHECK_RUNS=1 run
 expect "a check-runs failure is a fault, not a pass" 1 "failed to fetch check runs"
 expect "a check-runs failure names its required read grant" 1 "Checks (read) or Actions permissions.checks: read"
@@ -932,6 +1039,41 @@ reset_env
 PR_JSON_FIXTURE="$(printf '{"headRefOid":"%s","baseRefName":""}' "$HEAD_SHA")"
 run
 expect "a missing base ref is a fault, since it names the governing ruleset" 1 "could not resolve a base ref"
+
+# --- the scratch directory never outlives the run (#1784) ----------------------------
+# Every API response is written to one scratch directory under the caller's TMPDIR. Its
+# single EXIT trap must remove it on every path out -- an admission, a gate refusal,
+# and an evaluation fault alike -- or each gate run strands a copy of the payloads. The
+# stub lists TMPDIR mid-run, so a script that ignored TMPDIR (and so left this one
+# empty) cannot pass for one that cleaned up.
+expect_scratch_removed() { # label expected-rc
+  local mid
+  mid="$(sort -u "$TMPDIR_PROBE_LOG" | wc -l)"
+  if [ "$RC" -eq "$2" ] && [ "$mid" -eq 1 ] && [ -z "$(ls -A "$scratch_root")" ]; then
+    pass "$1"
+  else
+    fail "$1 (rc=$RC, entries seen mid-run=$mid, left behind: $(ls -A "$scratch_root" | tr '\n' ' '))"
+  fi
+}
+scratch_root="$tmp/scratch-root"
+for outcome in admitted gate-a fault; do
+  reset_env
+  rm -rf "$scratch_root"; mkdir -p "$scratch_root"
+  export TMPDIR_PROBE_LOG="$tmp/tmpdir-probe"
+  : >"$TMPDIR_PROBE_LOG"
+  case "$outcome" in
+    admitted) want=0 ;;
+    gate-a)
+      CHECK_RUNS_FIXTURE="$(runs "$(check_run 1 'ci / build-test' completed success "$APP_ID")")"
+      want=3 ;;
+    fault)
+      RUNS_FIXTURE="$(wf_runs "$(wf_run 9002 502 "$WF_CI" '"11"' pull_request completed success)")"
+      want=1 ;;
+  esac
+  TMPDIR="$scratch_root" run
+  expect_scratch_removed "the scratch directory is removed after the run ($outcome, exit $want)" "$want"
+  unset TMPDIR_PROBE_LOG
+done
 
 # --- ref spelling on the rules/branches/ path segment (#1470) --------------------
 reset_env
