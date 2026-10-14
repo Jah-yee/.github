@@ -966,7 +966,8 @@ jobs:
       # the default-branch caller, whose immutable verifier predates the canonical
       # organization casing (#1696, ADR 0227). This arm runs the organization ruleset's
       # current revision, so it alone can prove that a pull request is nothing but the
-      # byte-exact generated caller update to a newer canonical main commit. The proof
+      # byte-exact generated caller update to a newer canonical main commit, plus any
+      # allowlisted reusable CI pin moving to that same commit (ADR 0231). The proof
       # is inline because a required workflow cannot rely on checking out its own
       # revision. Any failed or unavailable proof leaves the ordinary dispatch in place.
       - name: Classify stale review caller bootstrap
@@ -1004,6 +1005,17 @@ jobs:
           PIN = re.compile(rb"^    uses: Verjson/\.github/\.github/workflows/ai-review-merge\.yml@([0-9a-f]{40})$", re.M)
           FRAGMENT = re.compile(r"NEXT/([0-9]{4}-[0-9]{2}-[0-9]{2})-issue-([1-9][0-9]{0,8}|[0-9]{8}T[0-9]{6}Z|[0-9a-f]{6,12})"
                                 r"-ai-review-caller-bootstrap\.md")
+          # Canonical reusable CI whose caller a bootstrap may move to the contract (ADR 0231). Closed:
+          # add a workflow only with evidence that a bootstrap cannot pass required checks without it.
+          REUSABLE_CI = (".github/workflows/node-ci.yml", ".github/workflows/actionlint.yml")
+          WORKFLOW_FILE = re.compile(r"\.github/workflows/[A-Za-z0-9._-]+\.ya?ml")
+          COMMENT = re.compile(rb"[ \t]*#")
+          # Line breaks YAML honors besides `\n` and `\r\n`. The proof splits on `\n` only, so any of them
+          # would let YAML structure hide inside what the proof reads as one comment line.
+          FOREIGN_BREAK = re.compile("\r(?!\n)|\x85|\u2028|\u2029")
+          JOB_KEY = re.compile(rb"  [A-Za-z_][A-Za-z0-9_-]*:(?:[ \t]+(?:#.*)?)?\r?")
+          JOBS_ROOT = re.compile(rb"jobs:(?:[ \t]+(?:#.*)?)?\r?")
+          REUSABLE_REF = re.compile(rb"(    uses: )([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/(\.github/workflows/[A-Za-z0-9._-]+\.ya?ml)@([0-9a-f]{40})((?:[ \t]+(?:#.*)?)?\r?)")
           INPUTS = (
               ("pr_number", True), ("expected_head_sha", True), ("authorization_check_id", True),
               ("arm_run_id", True), ("arm_run_attempt", True), ("explicit_rereview", False),
@@ -1125,6 +1137,57 @@ jobs:
               return pins[0].decode()
 
 
+          def enclosing(lines, index, width):
+              # The nearest earlier content line indented less than `width`; blanks and comments carry no structure.
+              for line in reversed(lines[:index]):
+                  content = line.lstrip(b" ")
+                  if content.strip() and not content.startswith(b"#") and len(line) - len(content) < width:
+                      return line
+              return b""
+
+
+          def job_call(lines, index):
+              # A reference is a job's reusable workflow call only directly under a bare job key inside the
+              # top-level `jobs:` map; under `note: >-` or a trigger key the same bytes mean something else.
+              return (JOB_KEY.fullmatch(enclosing(lines, index, 4)) is not None
+                      and JOBS_ROOT.fullmatch(enclosing(lines, index, 1)) is not None)
+
+
+          def reusable_ci_pins(path, before, after, contract):
+              # A reusable CI caller has no generator, so its proof is a line diff. A changed line is either an
+              # allowlisted canonical reusable workflow reference whose 40-hex revision alone moves to the
+              # contract, or a comment whose only change is that same revision swap.
+              for content in (before, after):
+                  try:
+                      text = content.decode("utf-8")
+                  except UnicodeDecodeError as error:
+                      raise Ineligible(f"{shown(path)} is not UTF-8") from error
+                  require(FOREIGN_BREAK.search(text) is None,
+                          f"{shown(path)} contains a line break other than \\n or \\r\\n")
+              old_lines, new_lines = before.split(b"\n"), after.split(b"\n")
+              require(len(old_lines) == len(new_lines), f"{shown(path)} changes more than its reusable CI pin")
+              stale, comments = set(), []
+              for index, (old, new) in enumerate(zip(old_lines, new_lines)):
+                  if old == new:
+                      continue
+                  if COMMENT.match(old) is not None:
+                      comments.append((old, new))
+                      continue
+                  ref = REUSABLE_REF.fullmatch(old)
+                  require(ref is not None and new == old[:ref.start(4)] + contract.encode() + old[ref.end(4):],
+                          f"{shown(path)} changes more than its reusable CI pin")
+                  require(same_repository(ref[2].decode(), CANONICAL) and ref[3].decode() in REUSABLE_CI,
+                          f"{shown(path)} moves a workflow that is not an allowlisted canonical reusable CI workflow")
+                  require(job_call(old_lines, index), f"{shown(path)} moves a reference that is not a job's reusable workflow call")
+                  stale.add(ref[4].decode())
+              for old, new in comments:
+                  moved = old
+                  for revision in stale:
+                      moved = moved.replace(revision.encode(), contract.encode())
+                  require(new == moved, f"{shown(path)} changes more than its reusable CI pin")
+              return stale
+
+
           def compare(base, head):
               comparison = api(f"repos/{CANONICAL}/compare/{base}...{head}")
               require(comparison["base_commit"]["sha"] == base, "canonical comparison base is not exact")
@@ -1192,7 +1255,6 @@ jobs:
               # swapping exactly those tokens; workflow and action configuration may not change at all.
               swaps = {stale.encode(): contract.encode(),
                        hashlib.sha256(base_caller).hexdigest().encode(): hashlib.sha256(head_caller).hexdigest().encode()}
-              swap = re.compile(b"|".join(re.escape(token) for token in sorted(swaps, key=len, reverse=True)))
               added = sorted(path for path in changed if path not in base_tree)
               require(len(added) <= 1, "the pull request adds more than one file")
               for path in added:
@@ -1204,9 +1266,21 @@ jobs:
                       raise Ineligible(f"{shown(path)} has an invalid date") from error
                   require(blob(repo, head_tree[path]) == render_fragment(match[1], match[2], stale, contract),
                           f"{shown(path)} is not the generated bootstrap changelog fragment")
-              for path in sorted(changed - {CALLER} - set(added)):
-                  base_entry, head_entry = base_tree.get(path), head_tree.get(path)
-                  require(base_entry is not None and head_entry is not None, f"{shown(path)} is not modified in place")
+              modified = sorted(changed - {CALLER} - set(added))
+              for path in modified:
+                  require(path in base_tree and path in head_tree, f"{shown(path)} is not modified in place")
+              # Exact-case only: GitHub runs workflows from `.github/workflows/` itself, never a subdirectory.
+              reusable_ci = [path for path in modified if WORKFLOW_FILE.fullmatch(path) is not None]
+              ci_stale = set()
+              for path in reusable_ci:
+                  ci_stale |= reusable_ci_pins(path, blob(repo, base_tree[path]), blob(repo, head_tree[path]), contract)
+              # A contract test may mirror a moved reusable CI pin as well; it moves to the same contract.
+              swaps.update({revision.encode(): contract.encode() for revision in ci_stale})
+              swap = re.compile(b"|".join(re.escape(token) for token in sorted(swaps, key=len, reverse=True)))
+              for path in modified:
+                  if path in reusable_ci:
+                      continue
+                  base_entry, head_entry = base_tree[path], head_tree[path]
                   # GitHub matches these names case-insensitively on case-insensitive checkouts.
                   folded = path.casefold()
                   require(not folded.startswith(".github/") and folded.rsplit("/", 1)[-1] not in ("action.yml", "action.yaml"),
@@ -1221,6 +1295,8 @@ jobs:
                       "default-branch review caller already contains the casing repair")
               require(contains(MINIMUM_SAFE_REVIEW, contract), "proposed revision predates the minimum safe review revision")
               require(contains(stale, contract), "proposed revision does not descend from the stale revision")
+              require(all(contains(revision, contract) for revision in ci_stale),
+                      "proposed revision does not descend from the stale reusable CI revision")
               require(contains(contract, "main"), "proposed revision is not on canonical main")
               return {"contract_sha": contract, "head_sha": head, "main_sha": main,
                       "paths": sorted(changed), "stale_sha": stale}
